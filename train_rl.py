@@ -4,6 +4,9 @@ import numpy as np
 import os
 import time
 
+from model import ActorCritic
+
+
 def main():
     # Load starting position
     centerline = np.loadtxt("./maps/sakhir_centerline.csv", delimiter=",", skiprows=1)
@@ -25,7 +28,7 @@ def main():
 
     for step in range(1, 1000):
         # Action: Steer right (+0.25 rad) at 7 m/s
-        action = np.array([[0.25, 10.0]]) # (steering angle, speed meters/sec)
+        action = np.array([[0.0, 10.0]]) # (steering angle, speed meters/sec)
         obs, reward, done, info = env.step(action)
 
         # Draw the scene
