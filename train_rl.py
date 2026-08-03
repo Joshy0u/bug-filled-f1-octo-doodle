@@ -1,3 +1,5 @@
+from pickle import TRUE
+
 import gym 
 import f110_gym
 import numpy as np
@@ -43,11 +45,12 @@ def main():
     
     action_std = torch.tensor([0.2, 0.5]).to(device)  # [steering_std, speed_std]
     min_action_std = torch.tensor([0.05, 0.1]).to(device)  # Minimum std for exploration
-    num_episodes = 10
+    num_episodes = 200
 
     # this is where the the main core loop goes:
     for episode in range(1, num_episodes+1):
         obs, reward, done, _ = env.reset(np.array([[start_x, start_y, start_yaw]]))
+        calc_reward(obs, done=True)  # Reset the last closest index for centerline reward
         episode_reward = 0.0
         step = 0
 
@@ -76,8 +79,8 @@ def main():
             next_obs, _, done, info = env.step(action_env)
 
             # Draw pyGame scene
-            env.render(mode="human")
-            time.sleep(0.01)  # slow down the rendering for visualization
+            #env.render(mode="human")
+            #time.sleep(0.01)  # slow down the rendering for visualization
 
             # STEP C: Calculate Custom Reward
             step_reward = calc_reward(next_obs, done)
