@@ -1,5 +1,3 @@
-from pickle import TRUE
-
 import gym 
 import f110_gym
 import numpy as np
@@ -12,17 +10,96 @@ from torch.distributions import Normal
 from model import ActorCritic
 from reward import calc_reward
 
+
+# NOTE: so entropy works, however the noise masks the actor critic model, so thats problematic
+# we have gotten to an ALRIGHT stopping point, but the car is frozen beacuse the policy is completely frozen
+# we need to find a balance between exploration and exploitation if possible
+# i am also considering prioritizing crashing a little bit, as a simulated annealing approach, so that the car can travel farther distances
+# lastly(and probably most doable in the immediate moment), is to clean up this code, not only making it readable, but also ensuring it still works after refactor.
+# consider trying the f1tenth ros2 labs or whatever they are called, this could be because i didnt do that first, so consider that. 
+
+def update_model(model, optimizer, states, actions, log_probs, rewards, next_states, dones, values, entropies, gamma=0.99):
+    """
+    Update the Actor-Critic model using the collected experience.
+    Performs N-step Advantage Actor-Critic (A2C) update, over mini-batch. 
+    
+    Parameters:
+        model (ActorCritic): The Actor-Critic model to be updated.
+        optimizer (torch.optim.Optimizer): The optimizer for updating the model.
+        states (torch.Tensor): Tensor of states.
+        actions (torch.Tensor): Tensor of actions taken.
+        log_probs (torch.Tensor): Log probabilities of the actions taken.
+        rewards (torch.Tensor): Tensor of rewards received.
+        next_states (torch.Tensor): Tensor of next states.
+        dones (torch.Tensor): Tensor indicating if the episode is done.
+        values (torch.Tensor): Tensor of state values predicted by the critic.
+        gamma (float): Discount factor for future rewards.
+
+    Returns:
+        None
+    """
+    returns = []
+
+    # Bootstrap value from the last state if not done
+    with torch.no_grad():
+        if dones[-1]:
+            next_value = 0.0
+        else:
+            _, next_val = model(next_states[-1])
+            next_value = next_val.item()
+
+    # N-step return calculation
+    R = next_value
+    for r, d in zip(reversed(rewards), reversed(dones)):
+        if d:
+            R = 0.0
+        R = r + gamma * R
+        returns.insert(0, R)
+
+    returns = torch.tensor(returns, dtype=torch.float32).to(states[0].device)
+    log_probs = torch.stack(log_probs)
+    entropies = torch.stack(entropies)
+    values = torch.squeeze(torch.stack(values), dim=1)
+
+    # Calculate advantages
+    advantages = returns - values
+
+    # advantage normalization
+    if len(advantages) > 1:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    # losses
+    actor_loss = -(log_probs * advantages.detach()).mean()
+    critic_loss = (returns - values).pow(2).mean()  # MSE between Discounted Return and Critic Value
+    entropy_loss = entropies.mean()
+    total_loss = actor_loss + 0.5 * critic_loss  # weight critic loss
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # prevents exploding gradients
+    optimizer.step()
+
+    return {
+        "actor_loss": actor_loss.item(),
+        "critic_loss": critic_loss.item(),
+        "total_loss": total_loss.item(),
+        "entropy_loss": entropy_loss.item(),
+        "mean_val": values.mean().item()
+    }
+
+
 def main():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # 1: instantiate the Model and Optimizer
     model = ActorCritic().to(device)
     if os.path.exists("f1_actor_critic.pt"):
-        model.load_state_dict(torch.load("f1_actor_critic.pt", map_location=device))
+        model.load_state_dict(torch.load("f1_actor_critic.pt", map_location=device, weights_only=True))
         print("Loaded existing model weights from 'f1_actor_critic.pt'.")
 
     optimizer = optim.Adam(model.parameters(), lr=0.0003)
     gamma = 0.99 # discount factor for future rewards (to prioritize immediate rewards over distant ones)
+    UPDATE_EVERY = 32
 
     # load staring position and setup env+map
     centerline = np.loadtxt("./maps/sakhir_centerline.csv", delimiter=",", skiprows=1)
@@ -45,12 +122,20 @@ def main():
     
     action_std = torch.tensor([0.2, 0.5]).to(device)  # [steering_std, speed_std]
     min_action_std = torch.tensor([0.05, 0.1]).to(device)  # Minimum std for exploration
-    num_episodes = 200
+    num_episodes = 50
+
+    recent_steps = []
+    last_metrics = {"actor_loss": 0.0, "critic_loss": 0.0, "total_loss": 0.0}
 
     # this is where the the main core loop goes:
     for episode in range(1, num_episodes+1):
         obs, reward, done, _ = env.reset(np.array([[start_x, start_y, start_yaw]]))
         calc_reward(obs, done=True)  # Reset the last closest index for centerline reward
+
+        # batch buffers for A2C update
+        states, actions, log_probs, entropies = [], [], [], []
+        rewards, next_states, dones, values = [], [], [], []
+
         episode_reward = 0.0
         step = 0
 
@@ -70,6 +155,9 @@ def main():
             raw_action = dist.sample()
             log_prob = dist.log_prob(raw_action).sum(dim=-1)  # Log probability of the sampled action
 
+            # calculate entropy for this step and store it.
+            step_entropy = dist.entropy().sum(dim=-1)            
+
             steering = torch.clamp(raw_action[..., 0], -0.4, 0.4)
             speed = torch.clamp( raw_action[..., 1], 3.0, 7.0)
 
@@ -84,35 +172,48 @@ def main():
 
             # STEP C: Calculate Custom Reward
             step_reward = calc_reward(next_obs, done)
-            episode_reward += step_reward
 
             # STEP D: LEARNING STEP (Backpropagation)
             next_scan_array = np.array(next_obs['scans'], dtype=np.float32)
             next_state_tensor = torch.FloatTensor(next_scan_array).to(device)
-            with torch.no_grad():
-                next_value = torch.zeros(1).to(device) if done else model(next_state_tensor)[1]
 
-            # Calculate Advantage ( Actual reward - Predicted reward)
-            td_target = step_reward + gamma * next_value
-            advantage = (td_target - state_value).detach()
+            # store transition in batch memory
+            states.append(state_tensor)
+            log_probs.append(log_prob)
+            entropies.append(step_entropy)
+            rewards.append(step_reward)
+            next_states.append(next_state_tensor)
+            dones.append(done)
+            values.append(state_value)
 
-            # Backpropagation on GPU (calculate Actor and Critic loss)
-            actor_loss = -log_prob * advantage # log prob * advantage
-            critic_loss = (td_target - state_value).pow(2) # MSE(Target, Predicted value)
-            total_loss = actor_loss + 0.5 * critic_loss  # weight critic loss
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # prevents exploding gradients
-            optimizer.step()
+            episode_reward += step_reward
 
             #advance state:
             obs = next_obs
+            if len(states) >= UPDATE_EVERY or done:
+                last_metrics = update_model(model, optimizer, states, actions, log_probs, rewards, next_states, dones, values, entropies, gamma)
+
+                # clear batch memory
+                states, actions, log_probs,  entropies= [], [], [], []
+                rewards, next_states, dones, values = [], [], [], []
 
         # Decrease action standard deviation over time (not inside while loop, otherwise it would decrease way too fast, per every step before episode ends)
-        action_std = torch.max(action_std * 0.995, min_action_std)
+        action_std = torch.max(action_std * 0.97, min_action_std)
+        recent_steps.append(step)
 
         print(f"Episode {episode:02d}/{num_episodes} | Steps survived: {step:03d} | Total Score: {episode_reward:+.2f}")
+       # Diagnostics block every 10 episodes
+        if episode % 10 == 0:
+            print("-" * 40)
+            print(f"--- DIAGNOSTICS AT EPISODE {episode:03d} ---")
+            print(f"  Avg Steps (last 10): {np.mean(recent_steps[-10:]):.1f}")
+            print(f"  Critic Loss:        {last_metrics['critic_loss']:.4f}")
+            print(f"  Actor Loss:         {last_metrics['actor_loss']:.4f}")
+            print(f"  Total Loss:         {last_metrics['total_loss']:.4f}")
+            print(f"  Entropy Loss:       {last_metrics['entropy_loss']:.4f}")
+            print(f"  Avg Predicted Val:  {last_metrics['mean_val']:.4f}")
+            print(f"  Current Action Std: {action_std.cpu().numpy().round(3)}")
+            print("-" * 40)
 
     torch.save(model.state_dict(), "f1_actor_critic.pt")
     print("\nTraining complete. Model saved as 'f1_actor_critic.pt'.")
