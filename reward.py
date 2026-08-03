@@ -12,7 +12,7 @@ def calc_reward(obs, done):
     """
     Calculates a custom reward signal based on vehicle telemetry and sensor data
 
-    parametetrs:
+    parameters:
         obs(dict): Observation dictionary returned by env.step()
         done(bool): Bool. Whether the car has collided/failed.
     """
@@ -22,7 +22,7 @@ def calc_reward(obs, done):
 
     # PROGRESS REWARD
     speed = max(0.0, obs['linear_vels_x'][0])
-    min_wall_dist = min(obs['scans'])
+    min_wall_dist = float(np.min(obs['scans']))
 
     # Scale speed reward to max ~0.7 
     speed_reward = (speed / 7.0) * 0.7  # Assuming max speed is 10 m/s

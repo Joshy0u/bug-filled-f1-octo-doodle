@@ -33,12 +33,21 @@ class ActorCritic(nn.Module):
         x = self.actor_base(state)
         raw_actions = torch.tanh(self.actor_head(x))
 
+        #dimensional check
+        if raw_actions.dim() > 1:
+            raw_steering = raw_actions[..., 0]
+            raw_speed = raw_actions[..., 1]
+        else: 
+            raw_steering = raw_actions[0]
+            raw_speed = raw_actions[1]
+
+
         # Scale raw actions to vehicle limits
         # Steering -0.4 rad to +0.4 rad |  Speed 1 m/s to 7 m/s
         # The raw actions are in the range [-1, 1], so we need to scale them to the desired range.
-        steering = raw_actions[0] * 0.4
-        speed = (raw_actions[1]+1.0) * 3.0 + 1.0
+        steering = raw_steering * 0.4
+        speed = (raw_speed+1.0) * 3.0 + 1.0
 
-        action = torch.tensor([steering, speed])
+        action = torch.stack([steering, speed], dim=-1)
 
         return action, state_value
