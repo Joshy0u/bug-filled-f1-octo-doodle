@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
+
 class ActorCritic(nn.Module):
     def __init__(self, input_dim=1080):
         super(ActorCritic, self).__init__()
@@ -22,7 +23,7 @@ class ActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 1) # the single value score V^pi(s)
+            nn.Linear(128, 1),  # the single value score V^pi(s)
         )
 
     def forward(self, state):
@@ -33,21 +34,6 @@ class ActorCritic(nn.Module):
         x = self.actor_base(state)
         raw_actions = torch.tanh(self.actor_head(x))
 
-        #dimensional check
-        if raw_actions.dim() > 1:
-            raw_steering = raw_actions[..., 0]
-            raw_speed = raw_actions[..., 1]
-        else: 
-            raw_steering = raw_actions[0]
-            raw_speed = raw_actions[1]
+        # i removed dimensional check here, but if it complains, then reminder to do the dimensional check [...,1] and [...,0] respectively
+        return raw_actions, state_value
 
-
-        # Scale raw actions to vehicle limits
-        # Steering -0.4 rad to +0.4 rad |  Speed 1 m/s to 7 m/s
-        # The raw actions are in the range [-1, 1], so we need to scale them to the desired range.
-        steering = raw_steering * 0.4
-        speed = (raw_speed+1.0) * 3.0 + 1.0
-
-        action = torch.stack([steering, speed], dim=-1)
-
-        return action, state_value
