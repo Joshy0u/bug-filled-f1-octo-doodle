@@ -1,3 +1,5 @@
+from math import e
+
 import gym
 import f110_gym
 import numpy as np
@@ -28,7 +30,7 @@ def scale_action(raw_action):
     """
     steering = raw_action[..., 0] * 0.4
     speed = (raw_action[..., 1] + 1.0) * 1.5 + 1.0
-    return steering, speed
+    return torch.stack([steering, speed], dim=-1)
 
 
 def update_model(
@@ -65,24 +67,20 @@ def update_model(
 
     # Bootstrap value from the last state if not done
     with torch.no_grad():
-        if dones[-1]:
-            next_value = 0.0
-        else:
-            _, next_val = model(next_states[-1])
-            next_value = next_val.item()
+        _, next_val = model(next_states[-1])
+        # mask out done states
+        next_value = next_val.squeeze(-1) * (1.0 - dones[-1].float())
 
     # N-step return calculation
     R = next_value
     for r, d in zip(reversed(rewards), reversed(dones)):
-        if d:
-            R = 0.0
-        R = r + gamma * R
+        R = r + gamma * R * (1.0 - d.float())
         returns.insert(0, R)
 
-    returns = torch.tensor(returns, dtype=torch.float32).to(states[0].device)
-    log_probs = torch.stack(log_probs)
-    entropies = torch.stack(entropies)
-    values = torch.squeeze(torch.stack(values), dim=1)
+    returns = torch.stack(returns)  # Shape: (T, NUM_AGENTS)
+    log_probs = torch.stack(log_probs)  # Shape: (T, NUM_AGENTS)
+    entropies = torch.stack(entropies)  # Shape: (T, NUM_AGENTS)
+    values = torch.stack(values).squeeze(-1)  # Shape: (T, NUM_AGENTS)
 
     # Calculate advantages
     advantages = returns - values
@@ -131,6 +129,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.0003)
     gamma = 0.99  # discount factor for future rewards (to prioritize immediate rewards over distant ones)
     UPDATE_EVERY = 64
+    MAX_STEPS = 1000
 
     # load staring position and setup env+map
     centerline = np.loadtxt("./maps/sakhir_centerline.csv", delimiter=",", skiprows=1)
@@ -154,77 +153,128 @@ def main():
     num_episodes = 20
 
     recent_steps = []
-    last_metrics = {"actor_loss": 0.0, "critic_loss": 0.0, "total_loss": 0.0}
+    last_metrics = {
+        "actor_loss": 0.0,
+        "critic_loss": 0.0,
+        "total_loss": 0.0,
+        "entropy_loss": 0.0,
+        "mean_val": 0.0,
+    }
 
     # this is where the the main core loop goes:
     for episode in range(1, num_episodes + 1):
-        obs, reward, done, _ = env.reset(
-            poses=np.array([[start_x, start_y, start_yaw]])
-        )
-        calc_reward(
-            obs, done=True
-        )  # Reset the last closest index for centerline reward
+        # 1. Generate staggered starting poses along the centerline for 4 car
+        start_poses = []
+        for i in range(NUM_AGENTS):
+            idx = (i * 3) % len(centerline)
+            next_idx = (idx + 1) % len(centerline)
+            x, y = centerline[idx, 0], centerline[idx, 1]
+            nextX, nextY = centerline[next_idx, 0], centerline[next_idx, 1]
+            yaw = np.arctan2(nextY - y, nextX - x)
+            start_poses.append([x, y, yaw])
 
-        # batch buffers for A2C update
+        obs, reward, done_signal, _ = env.reset(poses=np.array(start_poses))
         states, log_probs, entropies = [], [], []
         rewards, next_states, dones, values = [], [], [], []
 
-        episode_reward = 0.0
+        episode_rewards = np.zeros(NUM_AGENTS)
         step = 0
+        all_dones = np.zeros(NUM_AGENTS, dtype=bool)
 
-        while not done:
+        while not np.all(all_dones) and step < MAX_STEPS:
             step += 1
 
-            # STEP A: Feed LiDAR array -> numPY float32 -> PyTorch GPU Tensor
+            # STEP A: Feed multi-agent LiDAR scan array(Shape: 4, 1080) to PyTorch
             scan_array = np.array(obs["scans"], dtype=np.float32)
             state_tensor = torch.FloatTensor(scan_array).to(device)
 
-            # query ACtor-Critic model.
-            action_mean, state_value = model(state_tensor)
+            # Batched forward pass for all 4 agents
+            action_means, state_values = model(state_tensor)
 
-            # add exploration noise so the car tests different steering angles
-            # Use a Normal distribution to sample the noise
-            dist = Normal(action_mean, action_std)
-            raw_action = dist.sample()
-            raw_action_clamped = torch.clamp(raw_action, -1.0, 1.0)
+            dist = Normal(action_means, action_std)
+            raw_actions = dist.sample()
+            raw_actions_clamped = torch.clamp(raw_actions, -1.0, 1.0)
 
-            log_prob = dist.log_prob(raw_action).sum(
-                dim=-1
-            )  # Log probability of the sampled action
-            # calculate entropy for this step and store it.
+            log_prob = dist.log_prob(raw_actions_clamped).sum(dim=-1)
             step_entropy = dist.entropy().sum(dim=-1)
 
-            steering, speed = scale_action(raw_action_clamped)
-            action_env = np.array([[steering.item(), speed.item()]])
+            # Scale actions for environment (Shape: 4,2)
+            scaled_actions = scale_action(raw_actions_clamped)
+            env_actions = scaled_actions.cpu().numpy()
 
-            # STEP B: Step the Simulator
-            next_obs, _, done, info = env.step(action_env)
+            # Zero out actions for agents that already crashed so they stop moving
+            for i in range(NUM_AGENTS):
+                if all_dones[i]:
+                    env_actions[i] = [0.0, 0.0]
 
-            # Draw pyGame scene
+            # STEP B: Step the simulator
+            next_obs, _, gym_dones, info = env.step(env_actions)
             env.render(mode="human")
-            time.sleep(0.01)  # slow down the rendering for visualization
 
-            # STEP C: Calculate Custom Reward
-            step_reward = calc_reward(next_obs, done)
+            gym_dones_arr = np.array(gym_dones, dtype=bool)
 
-            # STEP D: LEARNING STEP (Backpropagation)
+            # STEP C: Calculate custom rewards per agent.
+            # Robustly convert gym_dones to a 1D array of shape (NUM_AGENTS)
+
+            if isinstance(gym_dones, (bool, np.bool_)):
+                # If gym returned a single boolean, duplicate it for all agents
+                gym_dones_arr = np.full(NUM_AGENTS, gym_dones, dtype=bool)
+            elif isinstance(gym_dones, dict):
+                gym_dones_arr = np.array(
+                    [
+                        gym_dones.get(f"agent_{i}", gym_dones.get(i, False))
+                        for i in range(NUM_AGENTS)
+                    ],
+                    dtype=bool,
+                )
+            else:
+                gym_dones_arr = np.atleast_1d(np.array(gym_dones, dtype=bool))
+
+            step_rewards_list = []
+            for i in range(NUM_AGENTS):
+                # Extract single agent observation slice
+                #
+                # IF agent was already dead before this step, give 0 reward and move on
+                if all_dones[i]:
+                    step_rewards_list.append(0.0)
+                    continue
+
+                # Check if this specific agent crashed ON THIS STEP.
+                just_crashed = bool(gym_dones_arr[i])
+                agent_obs = {
+                    "poses_x": next_obs["poses_x"][i],
+                    "poses_y": next_obs["poses_y"][i],
+                    "poses_theta": next_obs["poses_theta"][i],
+                    "linear_vels_x": next_obs["linear_vels_x"][i],
+                    "scans": next_obs["scans"][i],
+                }
+                r = calc_reward(agent_obs, done=just_crashed, agent_id=i)
+                step_rewards_list.append(r)
+
+            all_dones = np.logical_or(all_dones, gym_dones_arr)
+
+            step_rewards = torch.tensor(
+                step_rewards_list, dtype=torch.float32, device=device
+            )
+            step_dones = torch.tensor(gym_dones, dtype=torch.bool, device=device)
+
             next_scan_array = np.array(next_obs["scans"], dtype=np.float32)
             next_state_tensor = torch.FloatTensor(next_scan_array).to(device)
 
-            # store transition in batch memory
+            # buffer updates
             states.append(state_tensor)
             log_probs.append(log_prob)
             entropies.append(step_entropy)
-            rewards.append(step_reward)
+            rewards.append(step_rewards)
             next_states.append(next_state_tensor)
-            dones.append(done)
-            values.append(state_value)
+            dones.append(step_dones)
+            values.append(state_values)
 
-            episode_reward += step_reward
-
-            # advance state:
+            episode_rewards += np.array(step_rewards_list)
             obs = next_obs
-            if len(states) >= UPDATE_EVERY or done:
+
+            # STEP E: Learning step
+            if len(states) >= UPDATE_EVERY or np.all(all_dones):
                 last_metrics = update_model(
                     model,
                     optimizer,
@@ -237,30 +287,26 @@ def main():
                     entropies,
                     gamma,
                 )
-
-                # clear batch memory
                 states, log_probs, entropies = [], [], []
                 rewards, next_states, dones, values = [], [], [], []
-
         recent_steps.append(step)
-
         print(
-            f"Episode {episode:02d}/{num_episodes} | Steps survived: {step:03d} | Total Score: {episode_reward:+.2f}"
+            f"Episode {episode:02d}/{num_episodes} | Max Steps: {step:03d} | Mean Agent Score: {np.mean(episode_rewards):+.2f}"
         )
-        # Diagnostics block every 10 episodes
+
         if episode % 10 == 0:
             print("-" * 40)
             print(f"--- DIAGNOSTICS AT EPISODE {episode:03d} ---")
-            print(f"  Avg Steps (last 10): {np.mean(recent_steps[-10:]):.1f}")
-            print(f"  Critic Loss:        {last_metrics['critic_loss']:.4f}")
-            print(f"  Actor Loss:         {last_metrics['actor_loss']:.4f}")
-            print(f"  Total Loss:         {last_metrics['total_loss']:.4f}")
-            print(f"  Entropy Loss:       {last_metrics['entropy_loss']:.4f}")
-            print(f"  Avg Predicted Val:  {last_metrics['mean_val']:.4f}")
-            print(f"  Current Action Std: {action_std.cpu().numpy().round(3)}")
+            print(f"  Avg Max Steps (last 10): {np.mean(recent_steps[-10:]):.1f}")
+            print(f"  Critic Loss:         {last_metrics['critic_loss']:.4f}")
+            print(f"  Actor Loss:          {last_metrics['actor_loss']:.4f}")
+            print(f"  Total Loss:          {last_metrics['total_loss']:.4f}")
+            print(f"  Entropy Loss:        {last_metrics['entropy_loss']:.4f}")
+            print(f"  Avg Predicted Val:   {last_metrics['mean_val']:.4f}")
+            print(f"  Current Action Std:  {action_std.cpu().numpy().round(3)}")
             print("-" * 40)
 
-        # Decrease action standard deviation over time (not inside while loop, otherwise it would decrease way too fast, per every step before episode ends)
+        # Decay exploration noise per episode
         action_std = torch.max(action_std * 0.998, min_action_std)
 
     torch.save(model.state_dict(), "f1_actor_critic.pt")
