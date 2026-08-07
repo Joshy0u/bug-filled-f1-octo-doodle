@@ -41,18 +41,19 @@ def calc_reward(obs, done):
     # 1: CRASH PENALTY(fix)
     if done:
         _last_closest_index = None  # Reset for next episode
-        return -10.0
+        return -15.0
 
     # fallback to simple reward if CSV missing
     if CENTERLINE is None:
         print("Centerline data not available. Using speed-based reward only.")
         speed = max(0.0, obs["linear_vels_x"][0])
         return float(
-            np.clip((speed / 7.0) * 0.7, -1.0, 1.0)
+            np.clip((speed / 4.0) * 0.7, -1.0, 1.0)
         )  # Normalize speed to [-1, 1] range
 
-    # 2: GET VEHICLE POSITIONS AND SENSORS
+    # 2: GET VEHICLE POSITIONS AND SENSORS, AND VEHICLE ORIENTATION.
     car_x, car_y = obs["poses_x"][0], obs["poses_y"][0]
+    car_yaw = obs["poses_theta"][0]
     speed = max(0.0, obs["linear_vels_x"][0])  # Ensure speed is non-negative
     min_wall_distance = float(
         np.min(obs["scans"])
@@ -75,32 +76,58 @@ def calc_reward(obs, done):
     if idx_delta > len(CENTERLINE) // 2:
         idx_delta -= len(CENTERLINE)  # Wrap around for negative delta
 
+    curr_wp = CENTERLINE[closest_index]  # wp = waypoint.
+    last_wp = CENTERLINE[_last_closest_index]
+    meters_advanced = float(np.linalg.norm(curr_wp - last_wp))
+
     _last_closest_index = closest_index
 
     # Give positive reward for moving forward along waypoints, penalize for moving backward
     progress_reward = 0.0
     if idx_delta > 0:
-        progress_reward = min(0.4, idx_delta * 0.1)
+        progress_reward = meters_advanced * 8.0
     elif idx_delta < 0:
-        progress_reward = -0.5  # for driving backwards
-
+        progress_reward = -4.0 * meters_advanced  # for driving backwards
     # 5: SPEED REWARD
     speed_reward = (speed / 7.0) * 0.3
 
+    # NEW TRACK ALIGNMENT (Prevents wall swerving)
+    # #calculate vector next to centerline point
+    next_idx = (closest_index + 1) % len(CENTERLINE)
+    target_vec = CENTERLINE[next_idx] - CENTERLINE[closest_index]
+    target_yaw = np.arctan2(target_vec[1], target_vec[0])
+
+    heading_diff = np.abs(
+        np.arctan2(np.sin(car_yaw - target_yaw), np.cos(car_yaw - target_yaw))
+    )
+    alignment_reward = 0.3 * np.cos(
+        heading_diff
+    )  # +0.3 if aligned, negative if sideways.
+
+    # Reward velocity aligned with track
+    forward_speed = speed * np.cos(heading_diff)
+    speed_reward = max(0.0, (forward_speed * 0.5))
+
     # 6: OFF-CENTER PENALTY Width is 1.1m each side. , penalize if car approaches (>0.5m) off-center.
+    # ALSO INCLUDES STEP PENALTY (so it doesnt look to just stay alive)
+    step_cost = -0.05
+    wall_penalty = 0.0
+    if min_wall_distance < 0.4:
+        wall_penalty = -2.0 * (0.4 - min_wall_distance)
+
     off_center_penalty = 0.0
     if dist_to_centerline > 0.4:
-        off_center_penalty = -0.3 * (
-            (dist_to_centerline - 0.4) / 0.6
-        )  # Linear penalty up to 1.1m
-
-    # 7: EMERGENCY WALL PENALTY
-    wall_penalty = 0.0
-    if min_wall_distance < 0.25:
-        wall_penalty = -0.4 * (1.0 - (min_wall_distance / 0.4))
+        off_center_penalty = -1.0 * (dist_to_centerline - 0.4)
 
     # COMBINE ALL TERMS
-    total_reward = progress_reward + speed_reward + off_center_penalty + wall_penalty
-    total_reward = float(np.clip(total_reward, -2.0, 1.0))
+    total_reward = (
+        progress_reward
+        + speed_reward
+        + off_center_penalty
+        + wall_penalty
+        + alignment_reward
+        + step_cost
+    )
+    total_reward = float(np.clip(total_reward, -10.0, 10.0))
 
     return total_reward

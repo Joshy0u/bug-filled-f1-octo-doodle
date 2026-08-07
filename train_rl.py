@@ -130,7 +130,7 @@ def main():
 
     optimizer = optim.Adam(model.parameters(), lr=0.0003)
     gamma = 0.99  # discount factor for future rewards (to prioritize immediate rewards over distant ones)
-    UPDATE_EVERY = 16
+    UPDATE_EVERY = 64
 
     # load staring position and setup env+map
     centerline = np.loadtxt("./maps/sakhir_centerline.csv", delimiter=",", skiprows=1)
@@ -139,18 +139,19 @@ def main():
 
     # Initialize environment with GUI rendering
     map_path = os.path.abspath("./maps/sakhir")
-    env = gym.make("f110-v0", map=map_path, map_ext=".png", num_agents=1)
+    NUM_AGENTS = 4
+    env = gym.make("f110-v0", map=map_path, map_ext=".png", num_agents=NUM_AGENTS)
 
     # Action standard deviation for Gaussian exploration
     # currently its a static value range, but this means it wont rely on the model weights
     # for example if a car takes a good turn that step, the next step would be completely random, so over time we need to decrease
     # the use of action_std randomness, to allow the model to learn and exploit good actions.
 
-    action_std = torch.tensor([0.6, 0.3]).to(device)  # [steering_std, speed_std]
-    min_action_std = torch.tensor([0.35, 0.15]).to(  # to force more steering choices
+    action_std = torch.tensor([0.4, 0.2]).to(device)  # [steering_std, speed_std]
+    min_action_std = torch.tensor([0.15, 0.10]).to(  # to force more steering choices
         device
     )  # Minimum std for exploration
-    num_episodes = 300
+    num_episodes = 20
 
     recent_steps = []
     last_metrics = {"actor_loss": 0.0, "critic_loss": 0.0, "total_loss": 0.0}
@@ -200,8 +201,8 @@ def main():
             next_obs, _, done, info = env.step(action_env)
 
             # Draw pyGame scene
-            # env.render(mode="human")
-            # time.sleep(0.01)  # slow down the rendering for visualization
+            env.render(mode="human")
+            time.sleep(0.01)  # slow down the rendering for visualization
 
             # STEP C: Calculate Custom Reward
             step_reward = calc_reward(next_obs, done)
@@ -241,8 +242,6 @@ def main():
                 states, log_probs, entropies = [], [], []
                 rewards, next_states, dones, values = [], [], [], []
 
-        # Decrease action standard deviation over time (not inside while loop, otherwise it would decrease way too fast, per every step before episode ends)
-        action_std = torch.max(action_std * 0.98, min_action_std)
         recent_steps.append(step)
 
         print(
@@ -261,9 +260,12 @@ def main():
             print(f"  Current Action Std: {action_std.cpu().numpy().round(3)}")
             print("-" * 40)
 
+        # Decrease action standard deviation over time (not inside while loop, otherwise it would decrease way too fast, per every step before episode ends)
+        action_std = torch.max(action_std * 0.998, min_action_std)
+
     torch.save(model.state_dict(), "f1_actor_critic.pt")
     print("\nTraining complete. Model saved as 'f1_actor_critic.pt'.")
-    env.close
+    env.close()
 
 
 if __name__ == "__main__":
