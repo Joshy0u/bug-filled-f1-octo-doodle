@@ -96,7 +96,7 @@ def calc_reward(obs, done, agent_id=0):
     # Give positive reward for moving forward along waypoints, penalize for moving backward
     progress_reward = 0.0
     if idx_delta > 0:
-        progress_reward = meters_advanced * 8.0
+        progress_reward = meters_advanced * 12.0
     elif idx_delta < 0:
         progress_reward = -4.0 * meters_advanced  # for driving backwards
 

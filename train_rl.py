@@ -150,7 +150,7 @@ def main():
     min_action_std = torch.tensor([0.15, 0.10]).to(  # to force more steering choices
         device
     )  # Minimum std for exploration
-    num_episodes = 20
+    num_episodes = 200
 
     recent_steps = []
     last_metrics = {
