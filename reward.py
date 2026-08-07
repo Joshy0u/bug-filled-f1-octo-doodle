@@ -6,10 +6,6 @@ import numpy as np
 
 # V1, NOT WORRIED ABOUT RACING LINE OR OPTIMAL TIME JUST YET, ONLY TO FINISH A LAP.
 
-# need 3 things: progress/speed reward
-# wall penalty
-# collision penalty
-
 
 # NEW VARIANT: WITH CENTERLINE, REWARDING OFF CENTERLINE
 map_file = "./maps/sakhir_centerline.csv"
@@ -38,7 +34,7 @@ def calc_reward(obs, done, agent_id=0):
     global _last_closest_indices
 
     if isinstance(done, (list, np.ndarray)):
-        is_done = bool(done[0])
+        is_done = bool(done[agent_id]) if len(done) > agent_id else bool(done[0])
     else:
         is_done = bool(done)
 
@@ -85,6 +81,7 @@ def calc_reward(obs, done, agent_id=0):
     last_idx = _last_closest_indices[agent_id]
 
     # 4: REWARD CALCULATIONS
+
     # Calculate index delta handling track loop wrap-around
     idx_delta = (closest_index - last_idx) % len(CENTERLINE)
     if idx_delta > len(CENTERLINE) // 2:

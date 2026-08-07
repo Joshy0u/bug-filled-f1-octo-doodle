@@ -97,7 +97,7 @@ def update_model(
     entropy_loss = entropies.mean()
 
     # Decreased entropy loss weight slightly to prevent high noise overrides
-    total_loss = actor_loss + 0.5 * critic_loss - 0.02 * entropy_loss
+    total_loss = actor_loss + 0.5 * critic_loss - 0.05 * entropy_loss
 
     optimizer.zero_grad()
     total_loss.backward()
@@ -211,8 +211,6 @@ def main():
             next_obs, _, gym_dones, info = env.step(env_actions)
             env.render(mode="human")
 
-            gym_dones_arr = np.array(gym_dones, dtype=bool)
-
             # STEP C: Calculate custom rewards per agent.
             # Robustly convert gym_dones to a 1D array of shape (NUM_AGENTS)
 
@@ -240,7 +238,7 @@ def main():
                     continue
 
                 # Check if this specific agent crashed ON THIS STEP.
-                just_crashed = bool(gym_dones_arr[i])
+                agent_done = gym_dones_arr[i]
                 agent_obs = {
                     "poses_x": next_obs["poses_x"][i],
                     "poses_y": next_obs["poses_y"][i],
@@ -248,7 +246,7 @@ def main():
                     "linear_vels_x": next_obs["linear_vels_x"][i],
                     "scans": next_obs["scans"][i],
                 }
-                r = calc_reward(agent_obs, done=just_crashed, agent_id=i)
+                r = calc_reward(agent_obs, done=agent_done, agent_id=i)
                 step_rewards_list.append(r)
 
             all_dones = np.logical_or(all_dones, gym_dones_arr)
