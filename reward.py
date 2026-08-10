@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+from config import EnvConfig, rewardParams
 
 # NOTE: IF YOU WANT THE CAR TO GO FASTER, (I.E CHANGE THE MAX SPEED), YOU ALSO NEED TO CHANGE THE WEIGHTS ACCORDINGLY. (rn its tuned to 0.7+ reward for 7 m/s)
 
@@ -8,13 +9,12 @@ import numpy as np
 
 
 # NEW VARIANT: WITH CENTERLINE, REWARDING OFF CENTERLINE
-map_file = "./maps/sakhir_centerline.csv"
-if os.path.exists(map_file):
-    data = np.loadtxt(map_file, delimiter=",", skiprows=1)
+if os.path.exists(EnvConfig.map_file):
+    data = np.loadtxt(EnvConfig.map_file, delimiter=",", skiprows=1)
     CENTERLINE = data[:, :2]
 else:
     print(
-        f"Centerline map file '{map_file}' not found. Centerline reward will be disabled."
+        f"Centerline map file '{EnvConfig.map_file}' not found. Centerline reward will be disabled."
     )
     CENTERLINE = None
 
@@ -41,7 +41,7 @@ def calc_reward(obs, done, agent_id=0):
     # 1: CRASH PENALTY:
     if is_done:
         _last_closest_indices.pop(agent_id, None)  # reset only this agent's state.
-        return -100.0
+        return rewardParams.crash_penalty
 
     # Helper function to extract float safely whether input is scalar or array/list
     def get_scalar(val):
@@ -52,7 +52,7 @@ def calc_reward(obs, done, agent_id=0):
     # fallback to simple reward if CSV missing
     if CENTERLINE is None:
         print("Centerline data not available. Using speed-based reward only.")
-        speed = max(0.0, obs["linear_vels_x"])
+        speed = max(0.0, get_scalar(obs["linear_vels_x"]))
         return float(
             np.clip((speed / 4.0) * 0.7, -1.0, 1.0)
         )  # Normalize speed to [-1, 1] range
@@ -81,7 +81,6 @@ def calc_reward(obs, done, agent_id=0):
     last_idx = _last_closest_indices[agent_id]
 
     # 4: REWARD CALCULATIONS
-
     # Calculate index delta handling track loop wrap-around
     idx_delta = (closest_index - last_idx) % len(CENTERLINE)
     if idx_delta > len(CENTERLINE) // 2:
@@ -96,9 +95,11 @@ def calc_reward(obs, done, agent_id=0):
     # Give positive reward for moving forward along waypoints, penalize for moving backward
     progress_reward = 0.0
     if idx_delta > 0:
-        progress_reward = meters_advanced * 12.0
+        progress_reward = meters_advanced * rewardParams.progress_multiplier
     elif idx_delta < 0:
-        progress_reward = -4.0 * meters_advanced  # for driving backwards
+        progress_reward = (
+            rewardParams.backwards_multiplier * meters_advanced
+        )  # for driving backwards
 
     # NEW TRACK ALIGNMENT (Prevents wall swerving)
     # #calculate vector next to centerline point
@@ -109,18 +110,17 @@ def calc_reward(obs, done, agent_id=0):
     heading_diff = np.abs(
         np.arctan2(np.sin(car_yaw - target_yaw), np.cos(car_yaw - target_yaw))
     )
-    alignment_reward = 0.3 * np.cos(
+    alignment_reward = rewardParams.alignment_multiplier * np.cos(
         heading_diff
     )  # +0.3 if aligned, negative if sideways.
 
     # 5: SPEED REWARD
     # Reward velocity aligned with track
     forward_speed = speed * np.cos(heading_diff)
-    speed_reward = max(0.0, (forward_speed * 0.5))
+    speed_reward = max(0.0, (forward_speed * rewardParams.speed_multiplier))
 
     # 6: OFF-CENTER PENALTY Width is 1.1m each side. , penalize if car approaches (>0.5m) off-center.
     # ALSO INCLUDES STEP PENALTY (so it doesnt look to just stay alive)
-    step_cost = -0.05
     wall_penalty = 0.0
     if min_wall_distance < 0.6:
         wall_penalty = -5.0 * ((0.6 - min_wall_distance) ** 2)
@@ -136,7 +136,7 @@ def calc_reward(obs, done, agent_id=0):
         + off_center_penalty
         + wall_penalty
         + alignment_reward
-        + step_cost
+        + rewardParams.step_cost
     )
     total_reward = float(np.clip(total_reward, -10.0, 10.0))
 

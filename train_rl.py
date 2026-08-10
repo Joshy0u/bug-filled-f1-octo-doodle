@@ -1,5 +1,3 @@
-from math import e
-
 import gym
 import f110_gym
 import numpy as np
@@ -9,8 +7,10 @@ import torch
 import torch.optim as optim
 from torch.distributions import Normal
 
-from model import ActorCritic
-from reward import calc_reward
+from config import EnvConfig, Hyperparameters
+from network import ActorCritic, scale_action
+from reward import calc_reward, CENTERLINE
+from ppo_agent import update_model
 
 
 # NOTE: so entropy works, however the noise masks the actor critic model, so thats problematic
@@ -19,100 +19,6 @@ from reward import calc_reward
 # i am also considering prioritizing crashing a little bit, as a simulated annealing approach, so that the car can travel farther distances
 # lastly(and probably most doable in the immediate moment), is to clean up this code, not only making it readable, but also ensuring it still works after refactor.
 # consider trying the f1tenth ros2 labs or whatever they are called, this could be because i didnt do that first, so consider that.
-
-
-def scale_action(raw_action):
-    """
-    we are changing this so that it goes slower, and is able to turn in the physics engine.
-    Scales raw continuous model outputs [-1,1] to physical vehicle bounds:
-    steering: [-0,4, 0.4] rad
-    speed: [1.0, 7.0] m/s
-    """
-    steering = raw_action[..., 0] * 0.4
-    speed = (raw_action[..., 1] + 1.0) * 1.5 + 1.0
-    return torch.stack([steering, speed], dim=-1)
-
-
-def update_model(
-    model,
-    optimizer,
-    states,
-    log_probs,
-    rewards,
-    next_states,
-    dones,
-    values,
-    entropies,
-    gamma=0.99,
-):
-    """
-    Update the Actor-Critic model using the collected experience.
-    Performs N-step Advantage Actor-Critic (A2C) update, over mini-batch.
-
-    Parameters:
-        model (ActorCritic): The Actor-Critic model to be updated.
-        optimizer (torch.optim.Optimizer): The optimizer for updating the model.
-        states (torch.Tensor): Tensor of states.
-        log_probs (torch.Tensor): Log probabilities of the actions taken.
-        rewards (torch.Tensor): Tensor of rewards received.
-        next_states (torch.Tensor): Tensor of next states.
-        dones (torch.Tensor): Tensor indicating if the episode is done.
-        values (torch.Tensor): Tensor of state values predicted by the critic.
-        gamma (float): Discount factor for future rewards.
-
-    Returns:
-        None
-    """
-    returns = []
-
-    # Bootstrap value from the last state if not done
-    with torch.no_grad():
-        _, next_val = model(next_states[-1])
-        # mask out done states
-        next_value = next_val.squeeze(-1) * (1.0 - dones[-1].float())
-
-    # N-step return calculation
-    R = next_value
-    for r, d in zip(reversed(rewards), reversed(dones)):
-        R = r + gamma * R * (1.0 - d.float())
-        returns.insert(0, R)
-
-    returns = torch.stack(returns)  # Shape: (T, NUM_AGENTS)
-    log_probs = torch.stack(log_probs)  # Shape: (T, NUM_AGENTS)
-    entropies = torch.stack(entropies)  # Shape: (T, NUM_AGENTS)
-    values = torch.stack(values).squeeze(-1)  # Shape: (T, NUM_AGENTS)
-
-    # Calculate advantages
-    advantages = returns - values
-
-    # advantage normalization
-    if len(advantages) > 1:
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-    # losses
-    actor_loss = -(log_probs * advantages.detach()).mean()
-    critic_loss = (
-        (returns - values).pow(2).mean()
-    )  # MSE between Discounted Return and Critic Value
-    entropy_loss = entropies.mean()
-
-    # Decreased entropy loss weight slightly to prevent high noise overrides
-    total_loss = actor_loss + 0.5 * critic_loss - 0.05 * entropy_loss
-
-    optimizer.zero_grad()
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(
-        model.parameters(), max_norm=0.5
-    )  # prevents exploding gradients
-    optimizer.step()
-
-    return {
-        "actor_loss": actor_loss.item(),
-        "critic_loss": critic_loss.item(),
-        "total_loss": total_loss.item(),
-        "entropy_loss": entropy_loss.item(),
-        "mean_val": values.mean().item(),
-    }
 
 
 def main():
@@ -127,30 +33,33 @@ def main():
         print("Loaded existing model weights from 'f1_actor_critic.pt'.")
 
     optimizer = optim.Adam(model.parameters(), lr=0.0003)
-    gamma = 0.99  # discount factor for future rewards (to prioritize immediate rewards over distant ones)
-    UPDATE_EVERY = 64
-    MAX_STEPS = 1000
 
     # load staring position and setup env+map
-    centerline = np.loadtxt("./maps/sakhir_centerline.csv", delimiter=",", skiprows=1)
-    start_x, start_y = centerline[0, 0], centerline[0, 1]
-    start_yaw = np.arctan2(centerline[1, 1] - start_y, centerline[1, 0] - start_x)
+    centerline = CENTERLINE
+    if centerline is None:
+        centerline = np.loadtxt(EnvConfig.map_file, delimiter=",", skiprows=1)
+    # start_x, start_y = centerline[0, 0], centerline[0, 1]
+    # start_yaw = np.arctan2(centerline[1, 1] - start_y, centerline[1, 0] - start_x)
 
     # Initialize environment with GUI rendering
-    map_path = os.path.abspath("./maps/sakhir")
-    NUM_AGENTS = 4
-    env = gym.make("f110-v0", map=map_path, map_ext=".png", num_agents=NUM_AGENTS)
+    map_path = os.path.abspath(EnvConfig.map_prefix)
+    env = gym.make(
+        "f110-v0", map=map_path, map_ext=".png", num_agents=EnvConfig.num_agents
+    )
 
     # Action standard deviation for Gaussian exploration
     # currently its a static value range, but this means it wont rely on the model weights
     # for example if a car takes a good turn that step, the next step would be completely random, so over time we need to decrease
     # the use of action_std randomness, to allow the model to learn and exploit good actions.
 
-    action_std = torch.tensor([0.4, 0.2]).to(device)  # [steering_std, speed_std]
-    min_action_std = torch.tensor([0.15, 0.10]).to(  # to force more steering choices
+    action_std = torch.tensor(
+        Hyperparameters.init_action_std
+    )  # [steering_std, speed_std]
+    min_action_std = torch.tensor(
+        Hyperparameters.min_action_std
+    ).to(  # to force more steering choices
         device
     )  # Minimum std for exploration
-    num_episodes = 200
 
     recent_steps = []
     last_metrics = {
@@ -162,10 +71,10 @@ def main():
     }
 
     # this is where the the main core loop goes:
-    for episode in range(1, num_episodes + 1):
+    for episode in range(1, Hyperparameters.num_episodes + 1):
         # 1. Generate staggered starting poses along the centerline for 4 car
         start_poses = []
-        for i in range(NUM_AGENTS):
+        for i in range(EnvConfig.num_agents):
             idx = (i * 3) % len(centerline)
             next_idx = (idx + 1) % len(centerline)
             x, y = centerline[idx, 0], centerline[idx, 1]
@@ -177,11 +86,11 @@ def main():
         states, log_probs, entropies = [], [], []
         rewards, next_states, dones, values = [], [], [], []
 
-        episode_rewards = np.zeros(NUM_AGENTS)
+        episode_rewards = np.zeros(EnvConfig.num_agents)
         step = 0
-        all_dones = np.zeros(NUM_AGENTS, dtype=bool)
+        all_dones = np.zeros(EnvConfig.num_agents, dtype=bool)
 
-        while not np.all(all_dones) and step < MAX_STEPS:
+        while not np.all(all_dones) and step < EnvConfig.max_steps:
             step += 1
 
             # STEP A: Feed multi-agent LiDAR scan array(Shape: 4, 1080) to PyTorch
@@ -203,7 +112,7 @@ def main():
             env_actions = scaled_actions.cpu().numpy()
 
             # Zero out actions for agents that already crashed so they stop moving
-            for i in range(NUM_AGENTS):
+            for i in range(EnvConfig.num_agents):
                 if all_dones[i]:
                     env_actions[i] = [0.0, 0.0]
 
@@ -216,12 +125,12 @@ def main():
 
             if isinstance(gym_dones, (bool, np.bool_)):
                 # If gym returned a single boolean, duplicate it for all agents
-                gym_dones_arr = np.full(NUM_AGENTS, gym_dones, dtype=bool)
+                gym_dones_arr = np.full(EnvConfig.num_agents, gym_dones, dtype=bool)
             elif isinstance(gym_dones, dict):
                 gym_dones_arr = np.array(
                     [
                         gym_dones.get(f"agent_{i}", gym_dones.get(i, False))
-                        for i in range(NUM_AGENTS)
+                        for i in range(EnvConfig.num_agents)
                     ],
                     dtype=bool,
                 )
@@ -229,9 +138,8 @@ def main():
                 gym_dones_arr = np.atleast_1d(np.array(gym_dones, dtype=bool))
 
             step_rewards_list = []
-            for i in range(NUM_AGENTS):
+            for i in range(EnvConfig.num_agents):
                 # Extract single agent observation slice
-                #
                 # IF agent was already dead before this step, give 0 reward and move on
                 if all_dones[i]:
                     step_rewards_list.append(0.0)
@@ -272,7 +180,7 @@ def main():
             obs = next_obs
 
             # STEP E: Learning step
-            if len(states) >= UPDATE_EVERY or np.all(all_dones):
+            if len(states) >= Hyperparameters.update_every or np.all(all_dones):
                 last_metrics = update_model(
                     model,
                     optimizer,
@@ -283,13 +191,13 @@ def main():
                     dones,
                     values,
                     entropies,
-                    gamma,
+                    Hyperparameters.gamma,
                 )
                 states, log_probs, entropies = [], [], []
                 rewards, next_states, dones, values = [], [], [], []
         recent_steps.append(step)
         print(
-            f"Episode {episode:02d}/{num_episodes} | Max Steps: {step:03d} | Mean Agent Score: {np.mean(episode_rewards):+.2f}"
+            f"Episode {episode:02d}/{Hyperparameters.num_episodes} | Max Steps: {step:03d} | Mean Agent Score: {np.mean(episode_rewards):+.2f}"
         )
 
         if episode % 10 == 0:
