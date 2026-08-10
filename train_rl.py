@@ -12,13 +12,20 @@ from network import ActorCritic, scale_action
 from reward import calc_reward, CENTERLINE
 from ppo_agent import update_model
 
+"""
+MULTI-AGENT COLLISION & EPISODE LOGIC (f110_gym)
+------------------------------------------------
+1. DO NOT collapse `gym_dones` into a single scalar/boolean. f110_gym returns 
+   a global boolean wrapper that trips as soon as ANY single car collides.
+   
+2. Retrieve true per-agent collision states directly from the simulator:
+      collisions = np.array(env.unwrapped.sim.collisions, dtype=bool)
 
-# NOTE: so entropy works, however the noise masks the actor critic model, so thats problematic
-# we have gotten to an ALRIGHT stopping point, but the car is frozen beacuse the policy is completely frozen
-# we need to find a balance between exploration and exploitation if possible
-# i am also considering prioritizing crashing a little bit, as a simulated annealing approach, so that the car can travel farther distances
-# lastly(and probably most doable in the immediate moment), is to clean up this code, not only making it readable, but also ensuring it still works after refactor.
-# consider trying the f1tenth ros2 labs or whatever they are called, this could be because i didnt do that first, so consider that.
+3. Maintain an independent `all_dones` boolean vector (size = num_agents):
+   - When `collisions[i] == True`, set `all_dones[i] = True`.
+   - Freeze Agent `i` action to [0.0, 0.0] and reward to 0.0 for subsequent steps.
+   - Continue the episode until `np.all(all_dones) == True`.
+"""
 
 
 def main():
@@ -122,31 +129,37 @@ def main():
 
             # STEP C: Calculate custom rewards per agent.
             # Robustly convert gym_dones to a 1D array of shape (NUM_AGENTS)
+            # ^^ this comment above might have been the problem, one true value abruptly ends all the agents.
 
-            if isinstance(gym_dones, (bool, np.bool_)):
-                # If gym returned a single boolean, duplicate it for all agents
-                gym_dones_arr = np.full(EnvConfig.num_agents, gym_dones, dtype=bool)
-            elif isinstance(gym_dones, dict):
-                gym_dones_arr = np.array(
-                    [
-                        gym_dones.get(f"agent_{i}", gym_dones.get(i, False))
-                        for i in range(EnvConfig.num_agents)
-                    ],
-                    dtype=bool,
-                )
+            if isinstance(info, dict) and "collisions" in info:
+                # If gym returned a single boolean, duplicate it for all agents (this is the problem, i even wrote it...)
+                collisions = np.array(info["collisions"], dtype=bool)
             else:
-                gym_dones_arr = np.atleast_1d(np.array(gym_dones, dtype=bool))
+                # Safely bypass pyright static analysis to access f110_gym's sim object.
+                sim_obj = getattr(env.unwrapped, "sim", None)
+                if sim_obj is not None and hasattr(sim_obj, "collisions"):
+                    collisions = np.array(sim_obj.collisions, dtype=bool)
+                else:
+                    # Fallback if gym_dones is array-like or a single scalar.
+                    collisions = np.atleast_1d(gym_dones)
+                    if len(collisions) < EnvConfig.num_agents:
+                        collisions = np.full(EnvConfig.num_agents, bool(gym_dones))
 
+            for i in range(EnvConfig.num_agents):
+                if collisions[i]:
+                    all_dones[i] = True
+
+            # ---Reward Calculation per agent---
             step_rewards_list = []
             for i in range(EnvConfig.num_agents):
                 # Extract single agent observation slice
-                # IF agent was already dead before this step, give 0 reward and move on
-                if all_dones[i]:
+                # 1. If agent was already dead before this step, give 0 reward and keep them frozen.
+                if all_dones[i] and not collisions[i]:
                     step_rewards_list.append(0.0)
                     continue
 
                 # Check if this specific agent crashed ON THIS STEP.
-                agent_done = gym_dones_arr[i]
+                # 2. Extract single agent observation dictionary.
                 agent_obs = {
                     "poses_x": next_obs["poses_x"][i],
                     "poses_y": next_obs["poses_y"][i],
@@ -154,10 +167,11 @@ def main():
                     "linear_vels_x": next_obs["linear_vels_x"][i],
                     "scans": next_obs["scans"][i],
                 }
-                r = calc_reward(agent_obs, done=agent_done, agent_id=i)
-                step_rewards_list.append(r)
 
-            all_dones = np.logical_or(all_dones, gym_dones_arr)
+                # 3. Pass agent's specific collisions status into reward function.
+                agent_is_dead = all_dones[i]  # true on the step it collides.
+                r = calc_reward(agent_obs, done=agent_is_dead, agent_id=i)
+                step_rewards_list.append(r)
 
             step_rewards = torch.tensor(
                 step_rewards_list, dtype=torch.float32, device=device

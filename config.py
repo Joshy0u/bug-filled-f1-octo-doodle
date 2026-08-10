@@ -22,7 +22,7 @@ class Hyperparameters:
     lr: float = 0.0003
     gamma: float = 0.99
     update_every: int = 64
-    num_episodes: int = 200
+    num_episodes: int = 20
     clip_grad_norm: float = 0.5
 
     # Action exploration noise:
