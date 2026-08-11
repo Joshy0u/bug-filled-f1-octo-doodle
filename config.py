@@ -22,12 +22,12 @@ class Hyperparameters:
     lr: float = 0.0003
     gamma: float = 0.99
     update_every: int = 64
-    num_episodes: int = 20
+    num_episodes: int = 200
     clip_grad_norm: float = 0.5
 
     # Action exploration noise:
     init_action_std: tuple = (0.4, 0.2)
-    min_action_std: tuple = (0.15, 0.10)
+    min_action_std: tuple = (0.25, 0.15)
     std_decay: float = 0.998
 
 

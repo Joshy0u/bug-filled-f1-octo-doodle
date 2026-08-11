@@ -6,6 +6,8 @@ import time
 import torch
 import torch.optim as optim
 from torch.distributions import Normal
+from env_setup import make_f110_env, configure_agents_and_ghostmode
+
 
 from config import EnvConfig, Hyperparameters
 from network import ActorCritic, scale_action
@@ -50,10 +52,7 @@ def main():
 
     # Initialize environment with GUI rendering
     map_path = os.path.abspath(EnvConfig.map_prefix)
-    env = gym.make(
-        "f110-v0", map=map_path, map_ext=".png", num_agents=EnvConfig.num_agents
-    )
-
+    env = make_f110_env(map_path, ".png")
     # Action standard deviation for Gaussian exploration
     # currently its a static value range, but this means it wont rely on the model weights
     # for example if a car takes a good turn that step, the next step would be completely random, so over time we need to decrease
@@ -90,6 +89,7 @@ def main():
             start_poses.append([x, y, yaw])
 
         obs, reward, done_signal, _ = env.reset(poses=np.array(start_poses))
+        configure_agents_and_ghostmode(env)
         states, log_probs, entropies = [], [], []
         rewards, next_states, dones, values = [], [], [], []
 
@@ -126,27 +126,25 @@ def main():
             # STEP B: Step the simulator
             next_obs, _, gym_dones, info = env.step(env_actions)
             env.render(mode="human")
+            if step <= 2:
+                configure_agents_and_ghostmode(env)
 
             # STEP C: Calculate custom rewards per agent.
             # Robustly convert gym_dones to a 1D array of shape (NUM_AGENTS)
             # ^^ this comment above might have been the problem, one true value abruptly ends all the agents.
 
-            if isinstance(info, dict) and "collisions" in info:
-                # If gym returned a single boolean, duplicate it for all agents (this is the problem, i even wrote it...)
-                collisions = np.array(info["collisions"], dtype=bool)
+            sim_obj = getattr(env.unwrapped, "sim", None)
+            if sim_obj is not None and hasattr(sim_obj, "collisions"):
+                raw_collisions = np.array(sim_obj.collisions, dtype=bool)
+            elif isinstance(info, dict) and "collisions" in info:
+                raw_collisions = np.array(info["collisions"], dtype=bool)
             else:
-                # Safely bypass pyright static analysis to access f110_gym's sim object.
-                sim_obj = getattr(env.unwrapped, "sim", None)
-                if sim_obj is not None and hasattr(sim_obj, "collisions"):
-                    collisions = np.array(sim_obj.collisions, dtype=bool)
-                else:
-                    # Fallback if gym_dones is array-like or a single scalar.
-                    collisions = np.atleast_1d(gym_dones)
-                    if len(collisions) < EnvConfig.num_agents:
-                        collisions = np.full(EnvConfig.num_agents, bool(gym_dones))
+                raw_collisions = np.atleast_1d(gym_dones)
+                if len(raw_collisions) < EnvConfig.num_agents:
+                    raw_collisions = np.full(EnvConfig.num_agents, bool(gym_dones))
 
             for i in range(EnvConfig.num_agents):
-                if collisions[i]:
+                if raw_collisions[i]:
                     all_dones[i] = True
 
             # ---Reward Calculation per agent---
@@ -154,7 +152,7 @@ def main():
             for i in range(EnvConfig.num_agents):
                 # Extract single agent observation slice
                 # 1. If agent was already dead before this step, give 0 reward and keep them frozen.
-                if all_dones[i] and not collisions[i]:
+                if all_dones[i] and not raw_collisions[i]:
                     step_rewards_list.append(0.0)
                     continue
 
@@ -176,7 +174,7 @@ def main():
             step_rewards = torch.tensor(
                 step_rewards_list, dtype=torch.float32, device=device
             )
-            step_dones = torch.tensor(gym_dones, dtype=torch.bool, device=device)
+            step_dones = torch.tensor(all_dones, dtype=torch.bool, device=device)
 
             next_scan_array = np.array(next_obs["scans"], dtype=np.float32)
             next_state_tensor = torch.FloatTensor(next_scan_array).to(device)
