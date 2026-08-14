@@ -19,3 +19,5 @@ SO my RL agent might be driving completely blind
 
 IM BUILDING A PROTOTYPE GYM USING OPENAI AND ACCELERATED GPU USAGE. (8/14/2026)
 
+added the prototype and increased 5000x
+
