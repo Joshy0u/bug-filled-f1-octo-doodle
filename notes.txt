@@ -21,3 +21,8 @@ IM BUILDING A PROTOTYPE GYM USING OPENAI AND ACCELERATED GPU USAGE. (8/14/2026)
 
 added the prototype and increased 5000x
 
+
+i might start over , the code base has grown too much for me to understand whats going on anymore
+
+i need to study torch, neural networks, and 
+
