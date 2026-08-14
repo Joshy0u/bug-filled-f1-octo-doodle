@@ -14,5 +14,8 @@ SO my RL agent might be driving completely blind
 
 7: crash low speed -> low penalty, crash high speed -> high penalty. 
 
-8: use arjuns f1tenth repo and look at it.(theres more notes on my phone) 
+8: use arjuns f1tenth repo and look at it.(theres more notes on my phone)
+
+
+IM BUILDING A PROTOTYPE GYM USING OPENAI AND ACCELERATED GPU USAGE. (8/14/2026)
 

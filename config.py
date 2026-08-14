@@ -13,7 +13,7 @@ class EnvConfig:
     map_prefix: str = "./maps/sakhir"
 
     num_agents: int = 4
-    input_dim: int = 1080
+    input_dim: int = 1082  # 1080 LIDAr + velocity + steering angle
     max_steps: int = 1000
 
 

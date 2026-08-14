@@ -30,6 +30,15 @@ MULTI-AGENT COLLISION & EPISODE LOGIC (f110_gym)
 """
 
 
+def build_state_tensor(obs, current_steer_angles, device):
+    scans = np.array(obs["scans"], dtype=np.float32)  # Shape: (4, 1080)
+    vels = np.array(obs["linear_vels_x"], dtype=np.float32)[:, None]  # Shape: (4, 1)
+
+    # Horizontally stack features -> Shape: (4, 1082)
+    state_array = np.hstack([scans, vels, current_steer_angles])
+    return torch.FloatTensor(state_array).to(device)
+
+
 def main():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -97,12 +106,14 @@ def main():
         step = 0
         all_dones = np.zeros(EnvConfig.num_agents, dtype=bool)
 
+        # Track current active steering angle per agent -> Shape: (4,1)
+        current_steer_angles = np.zeros((EnvConfig.num_agents, 1), dtype=np.float32)
+
         while not np.all(all_dones) and step < EnvConfig.max_steps:
             step += 1
 
             # STEP A: Feed multi-agent LiDAR scan array(Shape: 4, 1080) to PyTorch
-            scan_array = np.array(obs["scans"], dtype=np.float32)
-            state_tensor = torch.FloatTensor(scan_array).to(device)
+            state_tensor = build_state_tensor(obs, current_steer_angles, device)
 
             # Batched forward pass for all 4 agents
             action_means, state_values = model(state_tensor)
@@ -117,6 +128,9 @@ def main():
             # Scale actions for environment (Shape: 4,2)
             scaled_actions = scale_action(raw_actions_clamped)
             env_actions = scaled_actions.cpu().numpy()
+
+            # Save current executed steering angles for the next step's state construction
+            current_steer_angles = env_actions[:, 0:1]
 
             # Zero out actions for agents that already crashed so they stop moving
             for i in range(EnvConfig.num_agents):
@@ -176,8 +190,10 @@ def main():
             )
             step_dones = torch.tensor(all_dones, dtype=torch.bool, device=device)
 
-            next_scan_array = np.array(next_obs["scans"], dtype=np.float32)
-            next_state_tensor = torch.FloatTensor(next_scan_array).to(device)
+            # Step D: Build next state tensor( 1082 dims)
+            next_state_tensor = build_state_tensor(
+                next_obs, current_steer_angles, device
+            )
 
             # buffer updates
             states.append(state_tensor)

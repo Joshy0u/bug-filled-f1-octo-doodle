@@ -33,21 +33,26 @@ def calc_reward(obs, done, agent_id=0):
 
     global _last_closest_indices
 
-    if isinstance(done, (list, np.ndarray)):
-        is_done = bool(done[agent_id]) if len(done) > agent_id else bool(done[0])
-    else:
-        is_done = bool(done)
-
-    # 1: CRASH PENALTY:
-    if is_done:
-        _last_closest_indices.pop(agent_id, None)  # reset only this agent's state.
-        return rewardParams.crash_penalty
-
     # Helper function to extract float safely whether input is scalar or array/list
     def get_scalar(val):
         if isinstance(val, (list, np.ndarray)):
             return float(val[0])
         return float(val)
+
+    if isinstance(done, (list, np.ndarray)):
+        is_done = bool(done[agent_id]) if len(done) > agent_id else bool(done[0])
+    else:
+        is_done = bool(done)
+
+    # Speed extraction happens here.
+    speed = max(0.0, get_scalar(obs["linear_vels_x"]))  # Ensure speed is non-negative
+
+    # 1: CRASH PENALTY:
+    if is_done:
+        _last_closest_indices.pop(agent_id, None)  # reset only this agent's state.
+        base_crash_penalty = rewardParams.crash_penalty
+        kinetic_penalty = -15.0 * (speed**2)
+        return float(base_crash_penalty + kinetic_penalty)
 
     # fallback to simple reward if CSV missing
     if CENTERLINE is None:
@@ -89,13 +94,14 @@ def calc_reward(obs, done, agent_id=0):
     curr_wp = CENTERLINE[closest_index]  # wp = waypoint.
     last_wp = CENTERLINE[last_idx]
     meters_advanced = float(np.linalg.norm(curr_wp - last_wp))
-
     _last_closest_indices[agent_id] = closest_index
 
     # Give positive reward for moving forward along waypoints, penalize for moving backward
     progress_reward = 0.0
     if idx_delta > 0:
-        progress_reward = meters_advanced * rewardParams.progress_multiplier
+        progress_reward = (
+            meters_advanced * rewardParams.progress_multiplier * (1.0 + 0.5 * speed)
+        )
     elif idx_delta < 0:
         progress_reward = (
             rewardParams.backwards_multiplier * meters_advanced
@@ -138,6 +144,6 @@ def calc_reward(obs, done, agent_id=0):
         + alignment_reward
         + rewardParams.step_cost
     )
-    total_reward = float(np.clip(total_reward, -10.0, 10.0))
+    total_reward = float(np.clip(total_reward, -50.0, 50.0))
 
     return total_reward
