@@ -8,7 +8,6 @@ import torch.optim as optim
 from torch.distributions import Normal
 from env_setup import make_f110_env, configure_agents_and_ghostmode
 
-
 from config import EnvConfig, Hyperparameters
 from network import ActorCritic, scale_action
 from reward import calc_reward, CENTERLINE
@@ -40,7 +39,7 @@ def build_state_tensor(obs, current_steer_angles, device):
 
 
 def main():
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 1: instantiate the Model and Optimizer
     model = ActorCritic().to(device)
@@ -52,29 +51,22 @@ def main():
 
     optimizer = optim.Adam(model.parameters(), lr=0.0003)
 
-    # load staring position and setup env+map
+    # load starting position and setup env+map
     centerline = CENTERLINE
     if centerline is None:
         centerline = np.loadtxt(EnvConfig.map_file, delimiter=",", skiprows=1)
-    # start_x, start_y = centerline[0, 0], centerline[0, 1]
-    # start_yaw = np.arctan2(centerline[1, 1] - start_y, centerline[1, 0] - start_x)
 
     # Initialize environment with GUI rendering
     map_path = os.path.abspath(EnvConfig.map_prefix)
     env = make_f110_env(map_path, ".png")
-    # Action standard deviation for Gaussian exploration
-    # currently its a static value range, but this means it wont rely on the model weights
-    # for example if a car takes a good turn that step, the next step would be completely random, so over time we need to decrease
-    # the use of action_std randomness, to allow the model to learn and exploit good actions.
 
+    # FIX: Ensure action_std and min_action_std are explicitly placed on CUDA device
     action_std = torch.tensor(
-        Hyperparameters.init_action_std
-    )  # [steering_std, speed_std]
+        Hyperparameters.init_action_std, device=device, dtype=torch.float32
+    )
     min_action_std = torch.tensor(
-        Hyperparameters.min_action_std
-    ).to(  # to force more steering choices
-        device
-    )  # Minimum std for exploration
+        Hyperparameters.min_action_std, device=device, dtype=torch.float32
+    )
 
     recent_steps = []
     last_metrics = {
@@ -85,9 +77,9 @@ def main():
         "mean_val": 0.0,
     }
 
-    # this is where the the main core loop goes:
+    # Main core loop
     for episode in range(1, Hyperparameters.num_episodes + 1):
-        # 1. Generate staggered starting poses along the centerline for 4 car
+        # 1. Generate staggered starting poses along the centerline for 4 cars
         start_poses = []
         for i in range(EnvConfig.num_agents):
             idx = (i * 3) % len(centerline)
@@ -144,9 +136,6 @@ def main():
                 configure_agents_and_ghostmode(env)
 
             # STEP C: Calculate custom rewards per agent.
-            # Robustly convert gym_dones to a 1D array of shape (NUM_AGENTS)
-            # ^^ this comment above might have been the problem, one true value abruptly ends all the agents.
-
             sim_obj = getattr(env.unwrapped, "sim", None)
             if sim_obj is not None and hasattr(sim_obj, "collisions"):
                 raw_collisions = np.array(sim_obj.collisions, dtype=bool)
@@ -164,14 +153,11 @@ def main():
             # ---Reward Calculation per agent---
             step_rewards_list = []
             for i in range(EnvConfig.num_agents):
-                # Extract single agent observation slice
-                # 1. If agent was already dead before this step, give 0 reward and keep them frozen.
+                # If agent was already dead before this step, give 0 reward and keep them frozen.
                 if all_dones[i] and not raw_collisions[i]:
                     step_rewards_list.append(0.0)
                     continue
 
-                # Check if this specific agent crashed ON THIS STEP.
-                # 2. Extract single agent observation dictionary.
                 agent_obs = {
                     "poses_x": next_obs["poses_x"][i],
                     "poses_y": next_obs["poses_y"][i],
@@ -180,8 +166,7 @@ def main():
                     "scans": next_obs["scans"][i],
                 }
 
-                # 3. Pass agent's specific collisions status into reward function.
-                agent_is_dead = all_dones[i]  # true on the step it collides.
+                agent_is_dead = all_dones[i]
                 r = calc_reward(agent_obs, done=agent_is_dead, agent_id=i)
                 step_rewards_list.append(r)
 
@@ -190,12 +175,12 @@ def main():
             )
             step_dones = torch.tensor(all_dones, dtype=torch.bool, device=device)
 
-            # Step D: Build next state tensor( 1082 dims)
+            # STEP D: Build next state tensor (1082 dims)
             next_state_tensor = build_state_tensor(
                 next_obs, current_steer_angles, device
             )
 
-            # buffer updates
+            # Buffer updates
             states.append(state_tensor)
             log_probs.append(log_prob)
             entropies.append(step_entropy)
@@ -223,6 +208,7 @@ def main():
                 )
                 states, log_probs, entropies = [], [], []
                 rewards, next_states, dones, values = [], [], [], []
+
         recent_steps.append(step)
         print(
             f"Episode {episode:02d}/{Hyperparameters.num_episodes} | Max Steps: {step:03d} | Mean Agent Score: {np.mean(episode_rewards):+.2f}"
@@ -250,3 +236,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
